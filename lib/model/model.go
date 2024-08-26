@@ -3,6 +3,7 @@ package model
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"crypto/sha256"
 	b64 "encoding/base64"
 	"errors"
@@ -20,7 +21,6 @@ import (
 	"github.com/cre4ture/syncthingfuse/lib/filetreecache"
 	"github.com/cznic/mathutil"
 	human "github.com/dustin/go-humanize"
-	"github.com/syncthing/syncthing/lib/connections"
 	"github.com/syncthing/syncthing/lib/protocol"
 	stsync "github.com/syncthing/syncthing/lib/sync"
 )
@@ -39,7 +39,7 @@ type Model struct {
 	pinnedList list.List
 	lmut       *sync.Cond // protects pull list. must not be acquired before fmut, nor after pmut
 
-	protoConn map[protocol.DeviceID]connections.Connection
+	protoConn map[protocol.DeviceID]protocol.Connection
 	pmut      stsync.RWMutex // protects protoConn. must not be acquired before fmut
 }
 
@@ -58,7 +58,7 @@ func NewModel(cfg *config.Wrapper, db *bolt.DB) *Model {
 
 		lmut: sync.NewCond(&lmutex),
 
-		protoConn: make(map[protocol.DeviceID]connections.Connection),
+		protoConn: make(map[protocol.DeviceID]protocol.Connection),
 		pmut:      stsync.NewRWMutex(),
 	}
 
@@ -163,7 +163,7 @@ func (m *Model) removeUnconfiguredFolders() {
 }
 
 // GetHello is called when we are about to connect to some remote device.
-func (m *Model) GetHello(protocol.DeviceID) protocol.HelloIntf {
+func (m *Model) GetHello(protocol.DeviceID) *protocol.Hello {
 	return &protocol.Hello{
 		DeviceName:    m.cfg.MyDeviceConfiguration().Name,
 		ClientName:    "SyncthingFUSE",
@@ -174,7 +174,7 @@ func (m *Model) GetHello(protocol.DeviceID) protocol.HelloIntf {
 // OnHello is called when an device connects to us.
 // This allows us to extract some information from the Hello message
 // and add it to a list of known devices ahead of any checks.
-func (m *Model) OnHello(remoteID protocol.DeviceID, addr net.Addr, hello protocol.HelloResult) error {
+func (m *Model) OnHello(remoteID protocol.DeviceID, addr net.Addr, hello protocol.Hello) error {
 	if _, ok := m.cfg.Devices()[remoteID]; ok {
 		// The device exists
 		return nil
@@ -183,8 +183,8 @@ func (m *Model) OnHello(remoteID protocol.DeviceID, addr net.Addr, hello protoco
 	return errDeviceUnknown
 }
 
-func (m *Model) AddConnection(conn connections.Connection, hello protocol.HelloResult) {
-	deviceID := conn.ID()
+func (m *Model) AddConnection(conn protocol.Connection, hello protocol.Hello) {
+	deviceID := conn.DeviceID()
 
 	m.fmut.RLock()
 	defer m.fmut.RUnlock()
@@ -322,7 +322,8 @@ func (m *Model) GetFileData(folder string, filepath string, readStart int64, rea
 
 	// create workers for pulling
 	for i, block := range entry.Blocks {
-		blockStart := int64(i * protocol.BlockSize)
+		blockSize := protocol.BlockSize(entry.FileSize())
+		blockStart := int64(i * blockSize)
 		blockEnd := blockStart + int64(block.Size)
 
 		if blockEnd > readStart {
@@ -342,7 +343,7 @@ func (m *Model) GetFileData(folder string, filepath string, readStart int64, rea
 					}
 					pendingBlocks = append(pendingBlocks, pendingBlock)
 				}
-			} else if blockStart < readEnd+protocol.BlockSize {
+			} else if blockStart < readEnd+int64(blockSize) {
 				if false == fbc.HasCachedBlockData(block.Hash) && false == fbc.HasPinnedBlock(block.Hash) {
 					// prefetch this block
 					m.getOrCreatePullStatus("Prefetch", folder, filepath, block, blockStart, assigned)
@@ -490,7 +491,7 @@ func (m *Model) isBlockStillNeeded(status *blockPullStatus) bool {
 	}
 
 	for i, block := range entry.Blocks {
-		blockStart := int64(i * protocol.BlockSize)
+		blockStart := int64(i * protocol.BlockSize(entry.FileSize()))
 		if blockStart == status.offset && bytes.Equal(block.Hash, status.block.Hash) {
 			return true
 		}
@@ -508,7 +509,7 @@ func (m *Model) pullBlock(status *blockPullStatus, addToCache bool) {
 
 	if done != status.state {
 		devices, _ := m.treeCaches[status.folder].GetEntryDevices(status.file)
-		conns := make([]connections.Connection, 0)
+		conns := make([]protocol.Connection, 0)
 		for _, deviceIndex := range rand.Perm(len(devices)) {
 			deviceWithFile := devices[deviceIndex]
 			if conn, ok := m.protoConn[deviceWithFile]; ok {
@@ -526,10 +527,20 @@ func (m *Model) pullBlock(status *blockPullStatus, addToCache bool) {
 
 		for _, conn := range conns {
 			if debug {
-				l.Debugln("Trying to fetch block at offset", status.offset, "for", status.folder, status.file, "from device", conn.ID().String()[:5])
+				l.Debugln("Trying to fetch block at offset", status.offset, "for", status.folder, status.file, "from device", conn.DeviceID().String()[:5])
 			}
 
-			requestedData, requestError = conn.Request(status.folder, status.file, status.offset, int(status.block.Size), status.block.Hash, false)
+			blockNo := int(status.block.Offset / int64(status.block.Size))
+			requestedData, requestError = conn.Request(
+				context.Background(),
+				status.folder,
+				status.file,
+				blockNo,
+				status.offset,
+				int(status.block.Size),
+				status.block.Hash,
+				status.block.WeakHash,
+				false)
 			if requestError == nil {
 				// check hash
 				actualHash := sha256.Sum256(requestedData)
@@ -669,7 +680,7 @@ func (m *Model) updateIndex(deviceID protocol.DeviceID, folder string, files []p
 		}
 
 		// remove if necessary
-		if existsInLocalModel && (globalToLocal == protocol.Greater || (file.Version.Concurrent(entry.Version) && file.WinsConflict(entry))) {
+		if existsInLocalModel && (globalToLocal == protocol.Greater || (file.Version.Concurrent(entry.Version) && protocol.WinsConflict(file, entry))) {
 			if debug {
 				l.Debugln("remove entry for", file.Name, "from", deviceID.String()[:5])
 			}
@@ -684,7 +695,7 @@ func (m *Model) updateIndex(deviceID protocol.DeviceID, folder string, files []p
 		}
 
 		// add if necessary
-		if !existsInLocalModel || (globalToLocal == protocol.Greater || (file.Version.Concurrent(entry.Version) && file.WinsConflict(entry))) || (globalToLocal == protocol.Equal) {
+		if !existsInLocalModel || (globalToLocal == protocol.Greater || (file.Version.Concurrent(entry.Version) && protocol.WinsConflict(file, entry))) || (globalToLocal == protocol.Equal) {
 			if file.IsDeleted() {
 				if debug {
 					l.Debugln("peer", deviceID.String()[:5], "has deleted file, doing nothing", file.Name)
@@ -716,7 +727,7 @@ func (m *Model) updateIndex(deviceID protocol.DeviceID, folder string, files []p
 			if m.isFilePinned(folder, file.Name) {
 				for i, block := range file.Blocks {
 					if false == fbc.HasPinnedBlock(block.Hash) {
-						blockStart := int64(i * protocol.BlockSize)
+						blockStart := int64(i * protocol.BlockSize(file.FileSize()))
 						status := m.getOrCreatePullStatus("Pin fetch", folder, file.Name, block, blockStart, queued)
 						m.pinnedList.PushBack(status)
 					}
@@ -746,7 +757,7 @@ func (m *Model) DownloadProgress(device protocol.DeviceID, folder string, update
 
 // The peer device closed the connection
 func (m *Model) Closed(conn protocol.Connection, err error) {
-	deviceID := conn.ID()
+	deviceID := conn.DeviceID()
 
 	m.pmut.Lock()
 	delete(m.protoConn, deviceID)
@@ -821,7 +832,7 @@ func (m *Model) GetConnections() []ConnectionInfo {
 	connections := make([]ConnectionInfo, 0)
 	for _, conn := range m.protoConn {
 		ci := ConnectionInfo{
-			DeviceID: conn.ID().String(),
+			DeviceID: conn.DeviceID().String(),
 			Address:  conn.RemoteAddr().String(),
 		}
 		connections = append(connections, ci)

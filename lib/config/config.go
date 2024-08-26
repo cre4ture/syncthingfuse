@@ -41,9 +41,9 @@ type GUIConfiguration struct {
 	RawAddress string `xml:"address" json:"address" default:"127.0.0.1:5833"`
 }
 
-func (f FolderConfiguration) GetCacheSizeBytes() (int32, error) {
+func (f FolderConfiguration) GetCacheSizeBytes() (int, error) {
 	bytes, err := human.ParseBytes(f.CacheSize)
-	return int32(bytes), err
+	return int(bytes), err
 }
 
 type OptionsConfiguration struct {
@@ -69,10 +69,14 @@ func New(myID protocol.DeviceID, myName string) Configuration {
 	setDefaults(&cfg.Options)
 
 	thisDevice, _ := protocol.DeviceIDFromString(cfg.MyID)
-	thisDeviceCfg := config.NewDeviceConfiguration(thisDevice, myName)
-	thisDeviceCfg.Addresses = []string{"dynamic"}
+	// thisDeviceCfg := config.New(thisDevice)
+	thisDeviceCfg2 := config.DeviceConfiguration{
+		DeviceID: thisDevice,
+	}
+
+	thisDeviceCfg2.Addresses = []string{"dynamic"}
 	cfg.Folders = []FolderConfiguration{}
-	cfg.Devices = []config.DeviceConfiguration{thisDeviceCfg}
+	cfg.Devices = []config.DeviceConfiguration{thisDeviceCfg2}
 
 	cfg.prepare()
 

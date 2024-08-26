@@ -156,3 +156,15 @@ func (w *Wrapper) Save() error {
 
 	return nil
 }
+
+func (w *Wrapper) DefaultDevice() stconfig.DeviceConfiguration {
+	return stconfig.DeviceConfiguration{}
+}
+
+func (w *Wrapper) DefaultFolder() stconfig.FolderConfiguration {
+	return stconfig.FolderConfiguration{}
+}
+
+func (w *Wrapper) DefaultIgnores() stconfig.Ignores {
+	return stconfig.Ignores{}
+}

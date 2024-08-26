@@ -130,11 +130,11 @@ func main() {
 	lans, _ := osutil.GetLans()
 
 	// Start discovery
-	cachedDiscovery := discover.NewCachingMux()
+	discoveryManager := discover.NewManager(myID, cfg, a.cert, a.evLogger, addrLister, connRegistry)
 	mainSvc.Add(cachedDiscovery)
 
 	// Start connection management
-	connectionsService := connections.NewService(cfg.AsStCfg(myID), myID, m, tlsCfg, cachedDiscovery, bepProtocolName, tlsDefaultCommonName, lans)
+	connectionsService := connections.NewService(cfg.AsStCfg(myID), myID, m, tlsCfg, discoveryManager, bepProtocolName, tlsDefaultCommonName, lans)
 	mainSvc.Add(connectionsService)
 
 	if cfg.Raw().Options.GlobalAnnounceEnabled {
